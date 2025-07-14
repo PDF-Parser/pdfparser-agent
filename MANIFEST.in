@@ -1,0 +1,6 @@
+include README.md
+include requirements.txt
+include LICENSE
+recursive-include pdfparser_agent *.py
+recursive-exclude * __pycache__
+recursive-exclude * *.py[co] 

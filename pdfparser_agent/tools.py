@@ -8,16 +8,22 @@ from typing import List, Optional, Tuple, Dict, Any
 from pydantic import BaseModel, HttpUrl
 from enum import Enum
 from langgraph.prebuilt import create_react_agent
+from .db import get_lines
+
+
+# In-memory memory, keyed by (user_id, document_id)
+clip_memory_db = {}
 
 
 # --- Markdown Output Helper ---
-def render_page_markdown(pdf, page_num: int, highlight_lines: Optional[List[int]] = None, highlight_match: Optional[int] = None) -> str:
-    """Render a page in markdown format with optional highlighting."""
-    total_pages = pdf.get_total_pages()
-    lines = pdf.get_page_lines(page_num)
+def render_page_markdown(document_id: str, user_id: str, page_num: int, highlight_lines: Optional[List[int]] = None, highlight_match: Optional[int] = None) -> str:
+    lines = get_lines(document_id, {"page_number": page_num})
+    total_pages = max([l["page_number"] for l in get_lines(document_id)]) if lines else 0
     out = [f"{'-'*42}\n|               Page {page_num} of {total_pages}             |\n{'-'*42}"]
     out.append("|                                        |\n|                                        |\n|                                        |")
-    for (p, l_on_p, g, text) in lines:
+    for l in lines:
+        g = l["global_line_number"]
+        text = l["text"]
         if highlight_lines and g in highlight_lines:
             line = f"|{g:03}| <highlight match=\"{highlight_match}\"></highlight> {text}"
         else:
@@ -28,81 +34,93 @@ def render_page_markdown(pdf, page_num: int, highlight_lines: Optional[List[int]
 
 
 # --- Tool: next_search_match ---
-def next_search_match(doc, search_term: str, match_number: Optional[int] = None) -> str:
+def next_search_match(document_id: str, user_id: str, search_term: str, match_number: Optional[int] = None) -> str:
     """
     Find the next match for a search term in the loaded PDF and render the page with the match highlighted.
     """
-    matches = [i for i, l in enumerate(doc.lines) if search_term.lower() in l[3].lower()]
+    all_lines = get_lines(document_id)
+    matches = [l for l in all_lines if search_term.lower() in l["text"].lower()]
     if not matches:
         return "No matches found."
     idx = match_number-1 if match_number else 0
     if idx >= len(matches):
         return f"Only {len(matches)} matches found."
-    match_idx = matches[idx]
-    page_num = doc.lines[match_idx][0]
-    global_line = doc.lines[match_idx][2]
-    return render_page_markdown(doc, page_num, highlight_lines=[global_line], highlight_match=idx+1)
+    match = matches[idx]
+    page_num = match["page_number"]
+    global_line = match["global_line_number"]
+    return render_page_markdown(document_id, user_id, page_num, highlight_lines=[global_line], highlight_match=idx+1)
 
 
 # --- Tool: goto ---
-def goto(doc, page: int = None, line: int = None) -> str:
+def goto(document_id: str, user_id: str, page: int = None, line: int = None) -> str:
     """
     Go to a specific page or line number in the PDF and render it in markdown. Takes either page or line as input.
     """
-    if page is not None and 1 <= page <= doc.get_total_pages():
-        return render_page_markdown(doc, page)
-    if line is not None and 1 <= line <= doc.get_total_lines():
-        l = doc.get_line_by_global(line)
-        if l:
-            return render_page_markdown(doc, l[0], highlight_lines=[line])
+    if page is not None:
+        return render_page_markdown(document_id, user_id, page)
+    if line is not None:
+        all_lines = get_lines(document_id, {"global_line_number": line})
+        if all_lines:
+            l = all_lines[0]
+            return render_page_markdown(document_id, user_id, l["page_number"], highlight_lines=[line])
     return "Invalid target."
 
 
 # --- Tool: scroll_up ---
-def scroll_up(doc, n: int) -> str:
+def scroll_up(document_id: str, user_id: str, n: int) -> str:
     """
-    Scroll up n lines from the current position (simulate by showing the previous n lines).
+    Scroll up n lines from the end (simulate by showing the previous n lines).
     """
-    lines = doc.lines[max(0, len(doc.lines)-n):]
+    all_lines = get_lines(document_id)
+    lines = all_lines[-n:] if n <= len(all_lines) else all_lines
     out = [f"{'-'*42}\n|   Scrolled Up {n} lines                |\n{'-'*42}"]
-    for (p, l_on_p, g, text) in lines:
+    for l in lines:
+        g = l["global_line_number"]
+        text = l["text"]
         out.append(f"|{g:03}| {text}")
     out.append("------------------------------------------")
     return '\n'.join(out)
 
 
 # --- Tool: scroll_down ---
-def scroll_down(doc, n: int) -> str:
+def scroll_down(document_id: str, user_id: str, n: int) -> str:
     """
-    Scroll down n lines from the current position (simulate by showing the next n lines).
+    Scroll down n lines from the start (simulate by showing the next n lines).
     """
-    lines = doc.lines[:n]
+    all_lines = get_lines(document_id)
+    lines = all_lines[:n]
     out = [f"{'-'*42}\n|   Scrolled Down {n} lines              |\n{'-'*42}"]
-    for (p, l_on_p, g, text) in lines:
+    for l in lines:
+        g = l["global_line_number"]
+        text = l["text"]
         out.append(f"|{g:03}| {text}")
     out.append("------------------------------------------")
     return '\n'.join(out)
 
 
 # --- Tool: clip_memory ---
-clip_memory_db = []
-def clip_memory(doc, line_num_start: int, line_num_end: int) -> str:
+def clip_memory(document_id: str, user_id: str, line_num_start: int, line_num_end: int) -> str:
     """
-    Clip lines from line_num_start to line_num_end and store in memory.
+    Clip lines from line_num_start to line_num_end and store in memory (per user/document).
     """
-    clip = [l for l in doc.lines if line_num_start <= l[2] <= line_num_end]
-    clip_memory_db.append(clip)
+    all_lines = get_lines(document_id)
+    clip = [l for l in all_lines if line_num_start <= l["global_line_number"] <= line_num_end]
+    key = (user_id, document_id)
+    if key not in clip_memory_db:
+        clip_memory_db[key] = []
+    clip_memory_db[key].append(clip)
     return f"Clipped lines {line_num_start} to {line_num_end}."
 
 
 # --- Tool: use_memory ---
-def use_memory(doc, prompt: str) -> str:
+def use_memory(document_id: str, user_id: str, prompt: str) -> str:
     """
     Use the clipped memory to answer a prompt (simulated).
     """
-    if not clip_memory_db:
+    key = (user_id, document_id)
+    if key not in clip_memory_db or not clip_memory_db[key]:
         return "No memory clipped."
-    lines = [line for clip in clip_memory_db for (_, _, _, line) in clip]
+    lines = [line["text"] for clip in clip_memory_db[key] for line in clip]
     return '\n'.join(lines)
 
 
@@ -190,4 +208,4 @@ def make_tool_with_doc(tool_func, doc):
         return tool_func(doc, *args, **kwargs)
     wrapper.__name__ = tool_func.__name__
     wrapper.__doc__ = tool_func.__doc__
-    return wrapper 
+    return wrapper
